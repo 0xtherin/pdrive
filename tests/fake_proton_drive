@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+"""Imitates the real `proton-drive` CLI (v0.9.0) on top of the FAKE_DRIVE_ROOT directory.
+
+Remote "/my-files/a/b" == $FAKE_DRIVE_ROOT/a/b. The trash and shares live in hidden
+`.fake_*` files inside the root. Like the real one, `fs list /` returns the
+sections [{"path": ...}] and `/trash`, `/shared-with-me` can be listed (the trash
+shows deleted items as /trash/<name>). On a conflict with no -f/-d given, it fails
+with exit 3 (the real one would prompt on stdin): this way tests detect clients that
+hang. FAKE_DRIVE_LOGGED_OUT=1 simulates being signed out.
+"""
+import hashlib
+import io
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT_REMOTE = "/my-files"
+FILE_FLAGS = {"create-new-revision", "rename", "replace", "skip", "remove"}
+DIR_FLAGS = {"merge", "rename", "replace", "skip", "remove"}
+
+
+class Fail(Exception):
+    def __init__(self, msg, rc=1):
+        super().__init__(msg)
+        self.rc = rc
+
+
+def root() -> Path:
+    r = os.environ.get("FAKE_DRIVE_ROOT")
+    if not r:
+        raise Fail("FAKE_DRIVE_ROOT is not set")
+    p = Path(r)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def hidden(name: str) -> bool:
+    return name.startswith(".fake_")
+
+
+# ---------- paths ----------
+def parts(remote: str):
+    if remote != ROOT_REMOTE and not remote.startswith(ROOT_REMOTE + "/"):
+        raise Fail(f"Node not found: {remote.strip('/').split('/')[0] or remote}")
+    rest = remote[len(ROOT_REMOTE):]
+    comps = [c.replace("\\/", "/") for c in re.split(r"(?<!\\)/", rest) if c]
+    if any(c in (".", "..") or hidden(c) for c in comps):
+        raise Fail(f"Node not found: {comps[-1]}")
+    return comps
+
+
+def real(remote: str) -> Path:
+    return root().joinpath(*parts(remote))
+
+
+def must_exist(remote: str) -> Path:
+    p = real(remote)
+    if not (p.exists() or p.is_symlink()):
+        c = parts(remote)
+        raise Fail(f"Node not found: {c[-1] if c else remote}")
+    return p
+
+
+def remote_of(p: Path) -> str:
+    rel = p.relative_to(root()).parts
+    return ROOT_REMOTE + "".join("/" + c.replace("/", "\\/") for c in rel)
+
+
+# ---------- metadata ----------
+def iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
+        f"{int(ts * 1000) % 1000:03d}Z"
+
+
+def uid(p: Path) -> str:
+    return hashlib.sha1(str(p.relative_to(root())).encode()).hexdigest()[:24]
+
+
+def sha1_of(p: Path) -> str:
+    h = hashlib.sha1()
+    with p.open("rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def shares() -> dict:
+    f = root() / ".fake_shares.json"
+    return json.loads(f.read_text()) if f.exists() else {}
+
+
+def save_shares(d: dict):
+    (root() / ".fake_shares.json").write_text(json.dumps(d))
+
+
+def node(p: Path) -> dict:
+    st = p.stat()
+    r = remote_of(p) if p != root() else ROOT_REMOTE
+    sh = shares().get(r, {})
+    is_dir = p.is_dir()
+    d = {
+        "uid": uid(p),
+        "parentUid": uid(p.parent),
+        "name": {"ok": True, "value": "My files" if p == root() else p.name},
+        "type": "folder" if is_dir else "file",
+        "isShared": bool(sh.get("url") or sh.get("members") or sh.get("invitations")),
+        "isSharedByUrl": bool(sh.get("url")),
+        "creationTime": iso(st.st_ctime),
+        "modificationTime": iso(st.st_mtime),
+    }
+    if not is_dir:
+        d["mediaType"] = "application/octet-stream"
+        d["totalStorageSize"] = st.st_size + 1000
+        d["activeRevision"] = {
+            "claimedSize": st.st_size,
+            "claimedModificationTime": iso(st.st_mtime),
+            "claimedDigests": {"sha1": sha1_of(p)},
+        }
+    return d
+
+
+def trash_items():
+    """[(tid, name, real_path)] of the fake trash."""
+    return [(k, v["name"], root() / ".fake_trash" / k / v["name"]) for k, v in trash_index().items()]
+
+
+def trash_node(tid: str, name: str, p: Path) -> dict:
+    d = node(p)
+    d["uid"], d["parentUid"] = tid, "trash"
+    d["name"] = {"ok": True, "value": name}
+    d["trashTime"] = iso(p.stat().st_mtime)
+    return d
+
+
+SECTIONS = ["/my-files", "/shared-with-me", "/trash"]
+
+
+# ---------- argument parsing ----------
+def parse(args, valued, multi=()):
+    """-> (opts, positionals, json). `valued` flags consume a value; `multi` ones accumulate."""
+    opts, pos, js = {}, [], False
+    it = iter(args)
+    for a in it:
+        if a in ("--json", "-j"):
+            js = True
+        elif a in ("-v", "--verbose"):
+            pass
+        elif a in valued:
+            try:
+                v = next(it)
+            except StopIteration:
+                raise Fail(f"Missing value for {a}")
+            key = valued[a]
+            if key in multi:
+                opts.setdefault(key, []).append(v)
+            else:
+                opts[key] = v
+        elif a in ("-t", "-n", "-a"):
+            opts[a] = True
+        elif a.startswith("-") and len(a) > 1 and not os.path.exists(a):
+            raise Fail(f"Unknown option: {a}")
+        else:
+            pos.append(a)
+    return opts, pos, js
+
+
+def out(obj, js, text=None):
+    if js:
+        print(json.dumps(obj))
+    else:
+        print(text if text is not None else (obj if isinstance(obj, str) else json.dumps(obj, indent=2)))
+
+
+# ---------- file utilities ----------
+def unique(dest_dir: Path, name: str) -> Path:
+    stem, dot, ext = name.rpartition(".")
+    if not dot or not stem:
+        stem, ext = name, ""
+    else:
+        ext = "." + ext
+    n = 1
+    while True:
+        c = dest_dir / f"{stem} ({n}){ext}"
+        if not c.exists():
+            return c
+        n += 1
+
+
+def trash_index():
+    f = root() / ".fake_trash" / "index.json"
+    return json.loads(f.read_text()) if f.exists() else {}
+
+
+def to_trash(p: Path):
+    td = root() / ".fake_trash"
+    td.mkdir(exist_ok=True)
+    idx = trash_index()
+    tid = secrets.token_hex(6)
+    (td / tid).mkdir()
+    orig = remote_of(p)
+    shutil.move(str(p), str(td / tid / p.name))
+    idx[tid] = {"orig": orig, "name": p.name}
+    (td / "index.json").write_text(json.dumps(idx))
+
+
+def need_strategy(flag, what):
+    if not flag:
+        raise Fail(f"Conflict on {what} and no strategy given (real CLI would prompt)", 3)
+
+
+def rm(p: Path):
+    shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()
+
+
+# ---------- upload / download ----------
+def put_file(src: Path, dest_dir: Path, ff, df):
+    dest = dest_dir / src.name
+    if dest.exists():
+        if dest.is_file() and sha1_of(dest) == sha1_of(src):
+            return
+        need_strategy(ff, src.name)
+        if ff == "skip":
+            return
+        if dest.is_dir():
+            dest = unique(dest_dir, src.name)
+        elif ff == "rename":
+            dest = unique(dest_dir, src.name)
+        elif ff == "replace":
+            to_trash(dest)
+        # create-new-revision: overwrite
+    shutil.copy2(src, dest)
+
+
+def put_dir(src: Path, dest_dir: Path, ff, df):
+    dest = dest_dir / src.name
+    if dest.exists():
+        need_strategy(df, src.name)
+        if df == "skip":
+            return
+        if df == "rename" or dest.is_file():
+            dest = unique(dest_dir, src.name)
+        elif df == "replace":
+            to_trash(dest)
+    dest.mkdir(exist_ok=True)
+    for c in sorted(src.iterdir()):
+        (put_dir if c.is_dir() else put_file)(c, dest, ff, df)
+
+
+def get_any(src: Path, local_dir: Path, ff, df):
+    dest = local_dir / src.name
+    is_dir = src.is_dir()
+    flag = df if is_dir else ff
+    if dest.exists():
+        if not is_dir and dest.is_file() and sha1_of(dest) == sha1_of(src):
+            return
+        need_strategy(flag, src.name)
+        if flag == "skip":
+            return
+        if flag == "rename" or (dest.is_dir() != is_dir and flag != "remove"):
+            dest = unique(local_dir, src.name)
+        elif flag == "remove":
+            rm(dest)
+    if is_dir:
+        dest.mkdir(exist_ok=True)
+        for c in sorted(src.iterdir()):
+            get_any(c, dest, ff, df)
+    else:
+        shutil.copy2(src, dest)
+
+
+# ---------- fs commands ----------
+def fs(cmd, args):
+    if cmd == "list":
+        o, pos, js = parse(args, {"-t": "type", "--type": "type"})
+        if len(pos) != 1:
+            raise Fail("Usage: filesystem list [-t TYPE] path")
+        r = pos[0].rstrip("/") or "/"
+        if r == "/":
+            out([{"path": x} for x in SECTIONS], js, "\n".join(SECTIONS))
+            return
+        if r == "/shared-with-me":
+            out([], js, "")
+            return
+        if r == "/trash":
+            items = [trash_node(*t) for t in trash_items()]
+            out(items, js, "\n".join(n["name"]["value"] for n in items))
+            return
+        p = must_exist(pos[0])
+        if not p.is_dir():
+            raise Fail("Not a folder")
+        items = [node(c) for c in sorted(p.iterdir()) if not hidden(c.name)]
+        if o.get("type"):
+            items = [n for n in items if n["type"] == o["type"]]
+        out(items, js, "\n".join(f"{n['type'][0]} {n['name']['value']}" for n in items))
+    elif cmd == "info":
+        o, pos, js = parse(args, {})
+        if pos[0].startswith("/trash/"):
+            nm = pos[0].split("/", 2)[2].replace("\\/", "/")
+            t = next((t for t in trash_items() if t[1] == nm), None)
+            if not t:
+                raise Fail(f"Node not found: {nm}")
+            out(trash_node(*t), js)
+            return
+        out(node(must_exist(pos[0])), js)
+    elif cmd == "size":
+        o, pos, js = parse(args, {})
+        p = must_exist(pos[0])
+        tot = p.stat().st_size if p.is_file() else sum(
+            f.stat().st_size for f in p.rglob("*") if f.is_file())
+        n = 1 + (sum(1 for _ in p.rglob("*")) if p.is_dir() else 0)
+        out({"size": tot, "numberOfDescendants": n}, js, f"{{ size: {tot}, numberOfDescendants: {n} }}")
+    elif cmd == "create-folder":
+        o, pos, js = parse(args, {})
+        if len(pos) != 2:
+            raise Fail("Usage: filesystem create-folder parentPath name")
+        parent = must_exist(pos[0])
+        if not parent.is_dir():
+            raise Fail("Parent is not a folder")
+        if not pos[1] or "/" in pos[1] or hidden(pos[1]):
+            raise Fail("Invalid folder name")
+        t = parent / pos[1]
+        if t.exists():
+            raise Fail(f"Node already exists: {pos[1]}")
+        t.mkdir()
+        out(node(t), js, f"Created {pos[1]}")
+    elif cmd == "upload":
+        o, pos, js = parse(args, {"-f": "ff", "--file-conflict-strategy": "ff",
+                                  "-d": "df", "--folder-conflict-strategy": "df"})
+        if o.get("ff") and o["ff"] not in FILE_FLAGS - {"remove"}:
+            raise Fail(f"Invalid file conflict strategy: {o['ff']}")
+        if o.get("df") and o["df"] not in DIR_FLAGS - {"remove"}:
+            raise Fail(f"Invalid folder conflict strategy: {o['df']}")
+        if len(pos) < 2:
+            raise Fail("Usage: filesystem upload [-f STRATEGY] [-d STRATEGY] [-t] localPath... parentPath")
+        dest = must_exist(pos[-1])
+        if not dest.is_dir():
+            raise Fail("Target is not a folder")
+        srcs = [Path(s) for s in pos[:-1]]
+        for s in srcs:
+            if not s.exists():
+                raise Fail(f"Local path not found: {s}")
+        for s in srcs:
+            (put_dir if s.is_dir() else put_file)(s, dest, o.get("ff"), o.get("df"))
+        out({"uploaded": len(srcs)}, js, f"Uploaded {len(srcs)} item(s)")
+    elif cmd == "download":
+        o, pos, js = parse(args, {"-f": "ff", "--file-conflict-strategy": "ff",
+                                  "-d": "df", "--folder-conflict-strategy": "df"})
+        if o.get("ff") and o["ff"] not in FILE_FLAGS - {"create-new-revision", "replace"}:
+            raise Fail(f"Invalid file conflict strategy: {o['ff']}")
+        if o.get("df") and o["df"] not in DIR_FLAGS - {"replace"}:
+            raise Fail(f"Invalid folder conflict strategy: {o['df']}")
+        if len(pos) < 2:
+            raise Fail("Usage: filesystem download [-f STRATEGY] [-d STRATEGY] path... localFolder")
+        local = Path(pos[-1])
+        srcs = [must_exist(r) for r in pos[:-1]]
+        local.mkdir(parents=True, exist_ok=True)
+        for s in srcs:
+            get_any(s, local, o.get("ff"), o.get("df"))
+        out({"downloaded": len(srcs)}, js, f"Downloaded {len(srcs)} item(s)")
+    elif cmd == "rename":
+        o, pos, js = parse(args, {})
+        p = must_exist(pos[0])
+        if not pos[1] or "/" in pos[1]:
+            raise Fail("Invalid name")
+        t = p.with_name(pos[1])
+        if t.exists():
+            raise Fail(f"Node already exists: {pos[1]}")
+        p.rename(t)
+        out({"name": pos[1]}, js, f"Renamed to {pos[1]}")
+    elif cmd in ("copy", "move"):
+        o, pos, js = parse(args, {"-n": "name", "--name": "name"})
+        dest = must_exist(pos[-1])
+        if not dest.is_dir():
+            raise Fail("Target is not a folder")
+        for r in pos[:-1]:
+            s = must_exist(r)
+            t = dest / (o.get("name") or s.name)
+            if t.exists():
+                raise Fail(f"Node already exists: {t.name}")
+            if s.is_dir():
+                if dest == s or s in dest.parents:
+                    raise Fail("Cannot copy/move a folder into itself")
+                (shutil.copytree if cmd == "copy" else shutil.move)(str(s), str(t))
+            else:
+                (shutil.copy2 if cmd == "copy" else shutil.move)(str(s), str(t))
+        out({"ok": True}, js, "Done")
+    elif cmd == "trash":
+        o, pos, js = parse(args, {})
+        ps = [must_exist(r) for r in pos]
+        for p in ps:
+            to_trash(p)
+        out({"trashed": len(ps)}, js, f"Trashed {len(ps)} item(s)")
+    elif cmd == "restore":
+        o, pos, js = parse(args, {})
+        idx = trash_index()
+        td = root() / ".fake_trash"
+        for r in pos:
+            tid = next((k for k, v in idx.items()
+                        if r == v["orig"] or r.rstrip("/").split("/")[-1] == v["name"]), None)
+            if not tid:
+                raise Fail(f"Node not found: {r.rstrip('/').split('/')[-1]}")
+            v = idx[tid]
+            dest = real(v["orig"])
+            if dest.exists():
+                raise Fail(f"Node already exists: {v['name']}")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(td / tid / v["name"]), str(dest))
+            shutil.rmtree(td / tid)
+            del idx[tid]
+        (td / "index.json").write_text(json.dumps(idx))
+        out({"ok": True}, js, "Restored")
+    elif cmd == "delete":
+        o, pos, js = parse(args, {})
+        idx = trash_index()
+        td = root() / ".fake_trash"
+        for r in pos:
+            tid = next((k for k, v in idx.items()
+                        if r == v["orig"] or r.rstrip("/").split("/")[-1] == v["name"]), None)
+            if tid:
+                shutil.rmtree(td / tid)
+                del idx[tid]
+            else:
+                raise Fail(f"Node is not in the trash: {r.rstrip('/').split('/')[-1]}")
+        if td.exists():
+            (td / "index.json").write_text(json.dumps(idx))
+        out({"ok": True}, js, "Deleted")
+    elif cmd == "empty-trash":
+        o, pos, js = parse(args, {})
+        shutil.rmtree(root() / ".fake_trash", ignore_errors=True)
+        out({"ok": True}, js, "Trash emptied")
+    else:
+        raise Fail(f"Command not found: filesystem {cmd}")
+
+
+# ---------- sharing commands ----------
+def sharing(cmd, args):
+    if cmd == "set-url":
+        o, pos, js = parse(args, {"--role": "role", "--password": "password",
+                                  "--expiration": "expiration"})
+        if o.get("role", "viewer") not in ("viewer", "editor"):
+            raise Fail(f"Invalid role: {o['role']}")
+        p = must_exist(pos[0])
+        r = remote_of(p) if p != root() else ROOT_REMOTE
+        sh = shares()
+        s = sh.setdefault(r, {})
+        s.setdefault("url", f"https://drive.proton.me/urls/{secrets.token_hex(5).upper()}"
+                            f"#{secrets.token_urlsafe(8)}")
+        s["role"] = o.get("role", "viewer")
+        s["password"] = o.get("password")
+        s["expiration"] = o.get("expiration")
+        save_shares(sh)
+        out({"url": s["url"], "role": s["role"], "expiration": s["expiration"]}, js,
+            f"Public link: {s['url']}")
+    elif cmd == "remove-url":
+        o, pos, js = parse(args, {})
+        p = must_exist(pos[0])
+        r = remote_of(p) if p != root() else ROOT_REMOTE
+        sh = shares()
+        if not sh.get(r, {}).get("url"):
+            raise Fail("Node has no public link")
+        del sh[r]["url"]
+        save_shares(sh)
+        out({"ok": True}, js, "Public link removed")
+    elif cmd == "invite":
+        o, pos, js = parse(args, {"-u": "user", "--user": "user", "-r": "role", "--role": "role",
+                                  "-m": "message", "--message": "message"}, multi=("user",))
+        if not o.get("user"):
+            raise Fail("No users given (-u)")
+        if o.get("role", "viewer") not in ("viewer", "editor", "admin", "inherited"):
+            raise Fail(f"Invalid role: {o['role']}")
+        p = must_exist(pos[0])
+        r = remote_of(p) if p != root() else ROOT_REMOTE
+        sh = shares()
+        mem = sh.setdefault(r, {}).setdefault("invitations", {})
+        for e in o["user"]:
+            mem[e] = o.get("role", "viewer")
+        save_shares(sh)
+        out({"invited": o["user"]}, js, f"Invited {', '.join(o['user'])}")
+    elif cmd == "remove":
+        o, pos, js = parse(args, {"-e": "email", "--email": "email"}, multi=("email",))
+        p = must_exist(pos[0])
+        r = remote_of(p) if p != root() else ROOT_REMOTE
+        sh = shares()
+        for key in ("members", "invitations"):
+            mem = sh.get(r, {}).get(key, {})
+            if "-a" in args:
+                mem.clear()
+            for e in o.get("email", []):
+                mem.pop(e, None)
+        save_shares(sh)
+        out({"ok": True}, js, "Removed")
+    elif cmd == "status":
+        o, pos, js = parse(args, {})
+        p = must_exist(pos[0])
+        r = remote_of(p) if p != root() else ROOT_REMOTE
+        s = shares().get(r, {})
+        ua = ({"uid": "fake", "role": s.get("role"), "url": s["url"],
+               "expirationTime": s.get("expiration"), "customPassword": s.get("password"),
+               "creatorEmail": "me@example.com"} if s.get("url") else None)
+        data = {"protonInvitations": [{"inviteeEmail": e, "role": ro}
+                                      for e, ro in s.get("invitations", {}).items()],
+                "nonProtonInvitations": [],
+                "members": [{"email": e, "role": ro} for e, ro in s.get("members", {}).items()],
+                "editorsCanShare": True}
+        if ua:
+            data["urlAccess"] = ua
+        txt = "Members: " + (", ".join(f"{m['email']} ({m['role']})" for m in data["members"]) or "none")
+        if s.get("url"):
+            txt += f"\nPublic link: {s['url']}"
+        out(data, js, txt)
+    else:
+        raise Fail(f"Command not found: sharing {cmd}")
+
+
+FS_CMDS = ["list", "info", "size", "create-folder", "upload", "download", "rename", "copy",
+           "move", "trash", "restore", "delete", "empty-trash"]
+SH_CMDS = ["status", "invite", "remove", "set-url", "remove-url"]
+
+
+def subseq(short, full):
+    """Real-style abbreviation: 'fs' -> filesystem (same initial, letters in order)."""
+    it = iter(full)
+    return short[:1] == full[:1] and all(c in it for c in short)
+
+
+def resolve(cmd, names):
+    if cmd in names:
+        return cmd
+    c = [n for n in names if n.startswith(cmd)]
+    return c[0] if len(c) == 1 else cmd
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print("Usage: fake_proton_drive {filesystem|sharing|auth} ...")
+        return 0
+    group = argv[0]
+    # abbreviations like the real one: fs, filesystem, s, sharing
+    if group == "auth":
+        sub = argv[1] if len(argv) > 1 else ""
+        if sub in ("login", "logout"):
+            print("Logged in" if sub == "login" else "Logged out")
+            return 0
+        raise Fail(f"Command not found: auth {sub}")
+    if os.environ.get("FAKE_DRIVE_LOGGED_OUT") == "1":
+        raise Fail("Not logged in. Run `proton-drive auth login`.")
+    if len(argv) < 2:
+        raise Fail("Command required")
+    cmd, args = argv[1], argv[2:]
+    if subseq(group, "filesystem"):
+        fs(resolve(cmd, FS_CMDS), args)
+    elif subseq(group, "sharing"):
+        sharing(resolve(cmd, SH_CMDS), args)
+    else:
+        raise Fail(f"Command not found: {group}")
+    return 0
+
+
+def log(kind, argv):
+    """FAKE_DRIVE_LOG=file: log each command (P = subprocess, S = interactive session)."""
+    f = os.environ.get("FAKE_DRIVE_LOG")
+    if f:
+        with open(f, "a") as fh:
+            fh.write(f"{kind} {' '.join(argv)}\n")
+
+
+def interactive():
+    """Interactive mode like the real one: prompt `proton-drive> `, one command per line;
+    errors go to stderr (without exiting) and there is no exit code.
+    Test hooks: FAKE_DRIVE_STALE=1 (caches `fs list` forever, like a CLI with cached
+    nodes), FAKE_DRIVE_DIE_AFTER=N (exits after N commands), FAKE_DRIVE_START_DELAY=s,
+    FAKE_DRIVE_CMD_DELAY=s, FAKE_DRIVE_HANG_ON=text (does not answer if the command contains it)."""
+    import time
+    time.sleep(float(os.environ.get("FAKE_DRIVE_START_DELAY", "0")))
+    cache, n = {}, 0
+    die = int(os.environ.get("FAKE_DRIVE_DIE_AFTER", "0"))
+    stale = os.environ.get("FAKE_DRIVE_STALE") == "1"
+    hang = os.environ.get("FAKE_DRIVE_HANG_ON")
+    while True:
+        sys.stdout.write("proton-drive> ")
+        sys.stdout.flush()
+        line = sys.stdin.readline()
+        if not line:
+            return 0
+        line = line.strip()
+        if not line:
+            continue
+        n += 1
+        if die and n > die:
+            return 1
+        if hang and hang in line:
+            time.sleep(3600)
+        time.sleep(float(os.environ.get("FAKE_DRIVE_CMD_DELAY", "0")))
+        try:
+            argv = shlex.split(line)
+        except ValueError as e:
+            print(str(e), file=sys.stderr, flush=True)
+            continue
+        log("S", argv)
+        if stale and line in cache:
+            sys.stdout.write(cache[line])
+            continue
+        buf, real_out = io.StringIO(), sys.stdout
+        sys.stdout = buf
+        try:
+            main(argv)
+        except Fail as e:
+            sys.stdout = real_out
+            real_out.write(buf.getvalue())
+            real_out.flush()
+            print(str(e), file=sys.stderr, flush=True)
+            continue
+        finally:
+            sys.stdout = real_out
+        real_out.write(buf.getvalue())
+        if stale and argv[:2] == ["fs", "list"]:
+            cache[line] = buf.getvalue()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 1:
+        sys.exit(interactive())
+    try:
+        log("P", sys.argv[1:])
+        sys.exit(main(sys.argv[1:]))
+    except Fail as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(e.rc)

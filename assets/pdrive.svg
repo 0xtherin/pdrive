@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Proton Drive</title>
+  <rect width="256" height="256" rx="56" fill="#6d4aff"/>
+  <g fill="#ffffff" transform="translate(128 128) scale(1.08) translate(-132 -123)">
+    <circle cx="88" cy="148" r="32"/>
+    <circle cx="130" cy="110" r="44"/>
+    <circle cx="176" cy="148" r="32"/>
+    <rect x="88" y="148" width="88" height="32"/>
+  </g>
+  <path d="M128 98 L100 128 H119 V166 H137 V128 H156 Z" fill="#6d4aff" stroke="#6d4aff" stroke-width="4" stroke-linejoin="round"/>
+</svg>

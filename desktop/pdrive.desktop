@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Proton Drive
+GenericName=Proton Drive Explorer
+GenericName[es]=Explorador de Proton Drive
+Comment=Browse, upload, download and share your Proton Drive files
+Comment[es]=Explora, sube, descarga y comparte tus archivos de Proton Drive
+Exec=@PDRIVE@ gui
+Icon=pdrive
+Terminal=false
+Categories=Network;FileTransfer;Utility;Qt;KDE;
+StartupWMClass=pdrive
+Keywords=proton;drive;cloud;
+Keywords[es]=proton;drive;nube;

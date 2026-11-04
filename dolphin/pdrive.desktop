@@ -1,0 +1,46 @@
+[Desktop Entry]
+Type=Service
+Name=Proton Drive
+MimeType=all/all;
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+X-KDE-Submenu=Proton Drive
+X-KDE-Submenu[es]=Proton Drive
+X-KDE-Protocols=file
+Icon=folder-cloud
+Actions=pdriveUpload;pdriveUploadTo;pdriveLink;pdriveShare;pdriveGui;pdriveOpen;
+
+[Desktop Action pdriveUpload]
+Name=Upload to Proton Drive
+Name[es]=Subir a Proton Drive
+Icon=cloud-upload
+Exec=@PDRIVE@ upload %F
+
+[Desktop Action pdriveUploadTo]
+Name=Upload to…
+Name[es]=Subir a…
+Icon=folder-cloud
+Exec=@PDRIVE@ uploadto %F
+
+[Desktop Action pdriveLink]
+Name=Copy public link
+Name[es]=Copiar enlace público
+Icon=edit-link
+Exec=@PDRIVE@ link %F
+
+[Desktop Action pdriveShare]
+Name=Share with…
+Name[es]=Compartir con…
+Icon=user-group-new
+Exec=@PDRIVE@ share %F
+
+[Desktop Action pdriveGui]
+Name=Open Proton Drive explorer
+Name[es]=Abrir explorador de Proton Drive
+Icon=pdrive
+Exec=@PDRIVE@ gui
+
+[Desktop Action pdriveOpen]
+Name=Open Proton Drive (web)
+Name[es]=Abrir Proton Drive (web)
+Icon=internet-services
+Exec=@PDRIVE@ open

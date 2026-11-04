@@ -1,0 +1,15 @@
+# Official Proton CLI (third-party software): download it from proton.me/drive/download
+/proton-drive
+# Generated
+__pycache__/
+*.pyc
+# Caches, configuration and user data: never commit these
+listings.json
+config.toml
+*.log
+*.db
+*.sqlite*
+.env
+# Internal development notes
+GUI_PLAN*.md
+ARCHITECTURE.md
