@@ -1,4 +1,4 @@
-# pdrive — a desktop app for Proton Drive on Linux
+# pdrive – Unofficial Proton Drive for Linux
 
 A graphical file manager (Qt), a Dolphin context menu and a command-line tool, all built on top of the
 official `proton-drive` CLI.
